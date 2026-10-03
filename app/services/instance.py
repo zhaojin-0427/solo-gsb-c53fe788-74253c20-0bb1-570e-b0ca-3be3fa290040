@@ -4,7 +4,11 @@ The generator produces the *smallest* value satisfying a normalized node
 (fewer object keys, shorter strings/arrays), and follows reference cycles with
 a depth budget so recursive schemas terminate. The validator is the same
 constraint set the comparator reasons about; it is used to verify that a
-generated counter-example passes exactly one side.
+generated counter-example passes exactly one side.  A third entry point,
+:func:`unsupported_along_value`, walks the schema graph *along an actual
+value* and reports the unsupported keywords (``pattern``, ``not`` …) the
+value's verdict still depends on — used by the call-coverage engine to mark
+such calls undetermined instead of silently counting them as covered.
 """
 from __future__ import annotations
 
@@ -159,6 +163,73 @@ def validate(node: SchemaNode, value: Any, path: str = "",
                    for b in node.any_of):
             errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
     return errors
+
+
+def unsupported_along_value(node: SchemaNode, value: Any,
+                            depth: int = 0) -> list:
+    """Unsupported keywords the value's verdict still depends on.
+
+    The walk follows the *actual value* through the resolved schema graph
+    (local ``$ref`` targets are already merged into the node graph): object
+    properties present in the value, array items, ``additionalProperties``
+    schemas for extra keys and ``oneOf`` / ``anyOf`` branches.  A keyword is
+    collected only when the value reaches its node without already failing
+    the node's supported constraints — absent optional properties and
+    branches the value rejects on known grounds never contribute, so they
+    cannot block a verdict.
+    """
+    hits: list = []
+    if node is None or node.is_bool is not None or node.is_cycle \
+            or node.invalid:
+        return hits
+    vt = _json_type(value)
+    if not type_allows(node, vt, value):
+        return hits  # decisively rejected by the supported type constraint
+    if value is None:
+        return hits  # mirrors validate(): no facet checks below null
+    hits.extend(node.unsupported)
+    if vt == "array" and node.items is not None and depth < MAX_DEPTH:
+        for item in value:
+            hits.extend(unsupported_along_value(node.items, item,
+                                                depth + 1))
+    if vt == "object" and depth < MAX_DEPTH:
+        for pname, pnode in node.properties.items():
+            if pname in value:
+                hits.extend(unsupported_along_value(pnode, value[pname],
+                                                    depth + 1))
+        if isinstance(node.additional, SchemaNode):
+            for key in sorted(k for k in value if k not in node.properties):
+                hits.extend(unsupported_along_value(node.additional,
+                                                    value[key], depth + 1))
+    if node.one_of and depth < MAX_DEPTH:
+        hits.extend(_combinator_hits("oneOf", node.one_of, value, depth))
+    if node.any_of and depth < MAX_DEPTH:
+        hits.extend(_combinator_hits("anyOf", node.any_of, value, depth))
+    return hits
+
+
+def _combinator_hits(kind: str, branches: list, value: Any,
+                     depth: int) -> list:
+    """Unsupported hits from a ``oneOf`` / ``anyOf`` reached by ``value``.
+
+    A branch the value already rejects on supported constraints cannot
+    change the outcome and is skipped.  ``anyOf`` is settled once any branch
+    passes cleanly; ``oneOf`` additionally needs every other branch to be
+    decidable, otherwise the exact match count is unknowable.
+    """
+    clean = False
+    pending: list = []
+    for branch in branches:
+        if validate(branch, value, depth=depth + 1):
+            continue  # decisively rejected on supported grounds
+        sub = unsupported_along_value(branch, value, depth + 1)
+        if sub:
+            pending.extend(sub)
+        else:
+            clean = True
+    if clean and (kind == "anyOf" or not pending):
+        return []
+    return pending
 
 
 def minimal_instance(node: SchemaNode, depth: int = 0,

@@ -350,6 +350,215 @@ def test_response_status_undeclared_fails(client):
     assert any("未在操作响应中声明" in x for x in doc["rows"][0]["reasons"])
 
 
+# ====================================================== 未支持关键字触达
+def test_param_pattern_touched_is_undetermined_not_covered(client):
+    spec = _spec({"/p": {"get": {"parameters": [
+        {"name": "s", "in": "query",
+         "schema": {"type": "string", "pattern": "^a"}},
+        {"name": "t", "in": "query", "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p", "query": {"s": "abc", "t": "x"},
+         "response": {"status": 200}},      # 触达 pattern → 无法判定
+        {"method": "GET", "path": "/p", "query": {"t": "x"},
+         "response": {"status": 200}},      # 可选参数 s 未提供 → 不误阻断
+    ]).json()
+    rows = doc["rows"]
+    assert rows[0]["outcome"] == "undetermined"
+    reason = rows[0]["reasons"][0]
+    assert "pattern" in reason and "无法判定" in reason
+    assert "/parameters/" in reason        # 位置：参数 schema 指针
+    assert rows[1]["outcome"] == "covered"
+    s = doc["summary"]
+    assert s["calls_undetermined"] == 1
+    assert s["calls_covered"] == 1
+    # 唯一的格由第 2 行覆盖；第 1 行未计入
+    cell = doc["operations"][0]["cells"][0]
+    assert cell["covered_by_line"] == 2
+
+
+def test_unsupported_keyword_blocks_cell_coverage(client):
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": {"type": "object", "properties": {
+                "name": {"type": "string", "pattern": "^a"}}}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"name": "abc"}}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert "pattern" in row["reasons"][0]
+    s = doc["summary"]
+    assert s["cells_total"] == 1
+    assert s["cells_covered"] == 0         # 不计覆盖
+    assert s["cells_gap"] == 1
+    assert doc["operations"][0]["gaps"][0]["key"] == "200|application/json"
+
+
+def test_untouched_optional_property_does_not_block(client):
+    schema = {"type": "object",
+              "properties": {"name": {"type": "string", "pattern": "^a"},
+                             "age": {"type": "integer"}}}
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": schema}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"age": 3}}},          # name 未触达 → 覆盖
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"age": 3, "name": "x"}}},  # 触达 → 无法判定
+    ]).json()
+    assert [r["outcome"] for r in doc["rows"]] == ["covered", "undetermined"]
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_request_body_pattern_via_local_ref(client):
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"required": True, "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/Payload"}}}},
+        "responses": {"201": {"description": "c"}}}}})
+    spec["components"] = {"schemas": {"Payload": {
+        "type": "object", "required": ["id"],
+        "properties": {"id": {"type": "integer"},
+                       "code": {"type": "string", "pattern": "^[A-Z]+$"}}}}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"id": 1, "code": "AB"}},
+         "response": {"status": 201}},
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": {"id": 1}},
+         "response": {"status": 201}},
+    ]).json()
+    rows = doc["rows"]
+    assert rows[0]["outcome"] == "undetermined"
+    reason = rows[0]["reasons"][0]
+    assert "pattern" in reason
+    # 位置指向本地 $ref 目标内的关键字
+    assert "#/components/schemas/Payload/properties/code/pattern" in reason
+    assert rows[1]["outcome"] == "covered"
+
+
+def test_response_array_items_pattern(client):
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": {"type": "array",
+                       "items": {"type": "string", "pattern": "^a"}}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": ["abc"]}},     # 元素触达 items.pattern
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": []}},          # 空数组未触达 → 覆盖
+    ]).json()
+    rows = doc["rows"]
+    assert rows[0]["outcome"] == "undetermined"
+    assert rows[1]["outcome"] == "covered"
+    assert doc["operations"][0]["cells"][0]["covered_by_line"] == 2
+
+
+def test_anyof_clean_branch_covers_sibling_pattern(client):
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": {"anyOf": [
+                {"type": "integer"},
+                {"type": "string", "pattern": "^a"}]}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": 5}},           # 干净命中 integer 分支 → 覆盖
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": "abc"}},       # 只能依赖 pattern 分支 → 无法判定
+    ]).json()
+    assert [r["outcome"] for r in doc["rows"]] == ["covered", "undetermined"]
+
+
+def test_oneof_sibling_pattern_makes_count_unknowable(client):
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": {"oneOf": [
+                {"type": "object",
+                 "properties": {"a": {"type": "integer"}}},
+                {"type": "object",
+                 "properties": {"a": {"type": "integer"},
+                                "b": {"type": "string",
+                                      "pattern": "^x"}}}]}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"a": 1}}},            # 仅命中分支 1 → 覆盖
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"a": 1, "b": "xy"}}},  # 分支 2 依赖 pattern
+    ]).json()
+    assert [r["outcome"] for r in doc["rows"]] == ["covered", "undetermined"]
+    assert "pattern" in doc["rows"][1]["reasons"][0]
+
+
+def test_known_failure_still_failed_despite_pattern(client):
+    spec = _spec({"/p": {"get": {"parameters": [
+        {"name": "s", "in": "query",
+         "schema": {"type": "string", "enum": ["a", "b"], "pattern": "^a"}}],
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p", "query": {"s": "c"},
+         "response": {"status": 200}},      # enum 决定性失败 → 校验失败
+        {"method": "GET", "path": "/p", "query": {"s": "a"},
+         "response": {"status": 200}},      # enum 通过、pattern 未支持 → 无法判定
+    ]).json()
+    assert [r["outcome"] for r in doc["rows"]] == [
+        "validation_failed", "undetermined"]
+
+
+def test_unsupported_keyword_row_persists_and_exports(client):
+    spec = _spec({"/p": {"get": {"responses": {
+        "200": {"description": "ok", "content": {"application/json": {
+            "schema": {"type": "object", "properties": {
+                "code": {"type": "string", "pattern": "^a"}}}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    up = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"code": "z"}}},
+    ])
+    assert up.status_code == 201, up.text
+    doc = up.json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert doc["summary"]["calls_undetermined"] == 1
+
+    # GET 返回同一逐行结论与缺口
+    got = client.get(f"/api/analyses/{aid}/coverage/baseline")
+    assert got.status_code == 200
+    assert got.json()["rows"] == doc["rows"]
+    assert got.json()["operations"] == doc["operations"]
+
+    # 确定性导出：两次字节一致，内容含同一结论
+    e1 = client.get(f"/api/analyses/{aid}/coverage/baseline/export")
+    e2 = client.get(f"/api/analyses/{aid}/coverage/baseline/export")
+    assert e1.content == e2.content
+    exported = json.loads(e1.content)
+    assert exported["rows"][0]["outcome"] == "undetermined"
+    assert "pattern" in exported["rows"][0]["reasons"][0]
+
+    # 主分析导出内嵌同一覆盖文档
+    main = json.loads(client.get(f"/api/analyses/{aid}/export").content)
+    assert main["call_coverage"]["baseline"]["rows"] == doc["rows"]
+
+
 # ============================================================== HTTP surface
 def test_coverage_404_unknown_analysis(client):
     r = _upload(client, "nope", "baseline", [

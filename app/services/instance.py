@@ -161,6 +161,78 @@ def validate(node: SchemaNode, value: Any, path: str = "",
     return errors
 
 
+# Unsupported keyword -> JSON types it constrains. Keywords missing from this
+# map (``not``, ``if``/``then``/``else``, unknown keywords, ``type[]`` …) may
+# constrain any value type.
+_UNSUPPORTED_KW_TYPES = {
+    "pattern": {"string"},
+    "contains": {"array"},
+    "minContains": {"array"},
+    "maxContains": {"array"},
+    "prefixItems": {"array"},
+    "unevaluatedItems": {"array"},
+    "propertyNames": {"object"},
+    "patternProperties": {"object"},
+    "dependentRequired": {"object"},
+    "dependentSchemas": {"object"},
+    "unevaluatedProperties": {"object"},
+}
+
+
+def unsupported_along_value(node: SchemaNode, value: Any,
+                            depth: int = 0) -> list:
+    """Unsupported keywords whose skipped constraints decide ``value``'s fate.
+
+    Walks the parsed schema graph *along the actual value* — local ``$ref``
+    (already resolved into the graph), nested properties, array items and
+    ``oneOf``/``anyOf`` branches — and returns ``(keyword, FacetLoc)`` for
+    every unsupported keyword the value's verdict still depends on. Optional
+    properties absent from the value are not visited, and keywords that do
+    not apply to the value's JSON type (e.g. ``pattern`` for an integer) are
+    ignored. For compositions the hits propagate only when *every* branch the
+    value passes relies on unsupported constraints; a single cleanly
+    validated branch makes the verdict solid.
+    """
+    hits: list = []
+    if node is None or depth >= MAX_DEPTH:
+        return hits
+    if node.is_bool is not None or node.is_cycle or node.invalid:
+        return hits  # bool/cycle/invalid nodes are reported by the caller
+
+    vt = _json_type(value)
+    for kw, loc in node.unsupported:
+        applies = _UNSUPPORTED_KW_TYPES.get(kw)
+        if applies is None or vt in applies:
+            hits.append((kw, loc))
+
+    if vt == "object":
+        for pname, pnode in node.properties.items():
+            if pname in value:
+                hits.extend(unsupported_along_value(
+                    pnode, value[pname], depth + 1))
+        if isinstance(node.additional, SchemaNode):
+            extra = [k for k in value if k not in node.properties]
+            for k in sorted(extra):
+                hits.extend(unsupported_along_value(
+                    node.additional, value[k], depth + 1))
+    elif vt == "array" and node.items is not None:
+        for item in value:
+            hits.extend(unsupported_along_value(node.items, item, depth + 1))
+
+    for branches in (node.one_of, node.any_of):
+        if not branches:
+            continue
+        passing = [b for b in branches if not validate(b, value)]
+        if not passing:
+            continue  # validate() already flags the mismatch for objects
+        per_branch = [unsupported_along_value(b, value, depth + 1)
+                      for b in passing]
+        if all(per_branch):  # every passing branch rests on unsupported rules
+            for branch_hits in per_branch:
+                hits.extend(branch_hits)
+    return hits
+
+
 def minimal_instance(node: SchemaNode, depth: int = 0,
                      force_type: str | None = None) -> Any:
     """Smallest value that validates against ``node`` (best effort)."""

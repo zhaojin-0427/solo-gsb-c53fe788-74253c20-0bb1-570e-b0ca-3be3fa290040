@@ -9,6 +9,10 @@
   单列一个无实体格；非 JSON 媒体类型不生成覆盖格（按行列明排除原因）；
 * 只有当**请求参数**、**请求体**、**响应体**三侧的可判定约束全部通过时，调用
   才覆盖该格；校验失败、无法判定、未匹配/未归属均逐行给出原因。
+* 已知约束全部通过后，还会**沿调用实际取值遍历解析后的 schema 图**（本地
+  ``$ref``、嵌套属性、数组元素、``oneOf``/``anyOf`` 分支）：只要该行能否通过
+  仍依赖 ``pattern`` 等未支持关键字，就列出关键字与位置并记为**无法判定**
+  （不计覆盖）；未触达的可选属性不影响判定。
 
 结果是确定性的：operation / cell 按固定顺序排列，每个格只记录最早一行覆盖调用，
 相同输入永远产生相同文档。
@@ -21,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import pointer as ptr
-from .instance import validate
+from .instance import validate, unsupported_along_value
 from .schemagraph import SchemaGraph
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head",
@@ -462,6 +466,19 @@ def _match_operation(operations: list[_Operation], call: _Call):
 
 
 # ============================================================ validation
+def _format_hits(hits, entry: str) -> str:
+    """确定性列出未支持关键字及其位置（去重、保持首次出现顺序）。"""
+    parts: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for kw, loc in hits:
+        where = loc.hint(entry)
+        if (kw, where) in seen:
+            continue
+        seen.add((kw, where))
+        parts.append(f"{kw}（{where}）")
+    return "、".join(parts)
+
+
 def _coerce_scalar(value: Any, node) -> tuple[Any, bool]:
     """把 HTTP 文本值尝试 coerce 为参数 schema 的标量类型。"""
     if not isinstance(value, str) or node is None or node.type is None:
@@ -484,20 +501,43 @@ def _coerce_scalar(value: Any, node) -> tuple[Any, bool]:
 
 
 def _check_value(label: str, node, value: Any,
-                 failures: list[str], undetermined: list[str]) -> None:
+                 failures: list[str], undetermined: list[str],
+                 entry: str) -> None:
     if node is None:
         return  # 声明了参数但无 schema —— 无取值约束
     if node.invalid or node.is_cycle:
         undetermined.append(
             f"{label}的约束无法判定（{node.invalid or '循环引用'}）")
         return
+    effective = value
     errors = validate(node, value)
-    if not errors:
+    if errors:
+        coerced, ok = _coerce_scalar(value, node)
+        if ok and not validate(node, coerced):
+            errors = []
+            effective = coerced
+    if errors:
+        failures.append(f"{label}不满足契约约束: {'; '.join(errors[:2])}")
         return
-    coerced, ok = _coerce_scalar(value, node)
-    if ok and not validate(node, coerced):
+    # 已知约束全部通过；若通过与否仍依赖被跳过的未支持约束 → 无法判定
+    hits = unsupported_along_value(node, effective)
+    if hits:
+        undetermined.append(
+            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
+
+
+def _check_body(label: str, node, value: Any,
+                failures: list[str], undetermined: list[str],
+                entry: str) -> None:
+    """请求体 / 响应体的 schema 核对（已知约束 + 值触达的未支持约束）。"""
+    errors = validate(node, value)
+    if errors:
+        failures.append(f"{label}不满足 schema: " + "; ".join(errors[:3]))
         return
-    failures.append(f"{label}不满足契约约束: {'; '.join(errors[:2])}")
+    hits = unsupported_along_value(node, value)
+    if hits:
+        undetermined.append(
+            f"{label}能否通过依赖未支持约束: {_format_hits(hits, entry)}")
 
 
 def _is_required(param: dict) -> bool:
@@ -505,7 +545,7 @@ def _is_required(param: dict) -> bool:
 
 
 def _check_parameters(op: _Operation, path_values: dict[str, str],
-                      call: _Call) -> tuple[list[str], list[str]]:
+                      call: _Call, entry: str) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     undetermined: list[str] = []
 
@@ -518,7 +558,7 @@ def _check_parameters(op: _Operation, path_values: dict[str, str],
                 f"路径变量 {name!r} 在操作参数中未声明为 in:path 参数")
             continue
         _check_value(f"路径参数 {name!r}={raw!r}", node, raw,
-                     failures, undetermined)
+                     failures, undetermined, entry)
 
     provided_maps = (
         ("query", call.query, False),
@@ -546,7 +586,7 @@ def _check_parameters(op: _Operation, path_values: dict[str, str],
                         f"缺少必填{loc_zh[location]}参数 {name!r}")
                 continue
             _check_value(f"{loc_zh[location]}参数 {name!r}", node, value,
-                         failures, undetermined)
+                         failures, undetermined, entry)
     return failures, undetermined
 
 
@@ -605,7 +645,7 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
 
     # ---- 请求参数
     path_values = _template_match(template, call.path) or {}
-    pf, pu = _check_parameters(op, path_values, call)
+    pf, pu = _check_parameters(op, path_values, call, graph.entry)
     failures.extend(pf)
     undetermined.extend(pu)
 
@@ -646,11 +686,9 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
                             f"请求体 {mt} 的 schema 无法判定"
                             f"（{node.invalid or '循环引用'}）")
                     else:
-                        errors = validate(node, call.request.get("body"))
-                        if errors:
-                            failures.append(
-                                f"请求体 {mt} 不满足 schema: "
-                                + "; ".join(errors[:3]))
+                        _check_body(f"请求体 {mt}", node,
+                                    call.request.get("body"),
+                                    failures, undetermined, graph.entry)
 
     # ---- 响应状态码归属
     resolved = _resolve_response_status(op, call.response["status"])
@@ -701,11 +739,9 @@ def _evaluate(graph: SchemaGraph, operations: list[_Operation],
                         f"响应 {code} {mt} 的 schema 无法判定"
                         f"（{node.invalid or '循环引用'}）")
                 else:
-                    errors = validate(node, call.response.get("body"))
-                    if errors:
-                        failures.append(
-                            f"响应 {code} {mt} 载荷不满足 schema: "
-                            + "; ".join(errors[:3]))
+                    _check_body(f"响应 {code} {mt} 载荷", node,
+                                call.response.get("body"),
+                                failures, undetermined, graph.entry)
 
     # ---- 汇总：只有可判定约束全部通过才覆盖
     if excluded:

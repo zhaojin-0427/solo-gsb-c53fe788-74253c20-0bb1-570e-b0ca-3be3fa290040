@@ -31,7 +31,8 @@ requestBody 被删除（`PARAMETER_MADE_REQUIRED` / `PARAMETER_ADDED_REQUIRED` /
 - 结果可按严重度（破坏性 / 无法判定 / 兼容）筛选，按端点分组或扁平浏览；
 - **调用覆盖视图**：上传 NDJSON 调用记录，按「响应状态码 × JSON 媒体类型」
   生成覆盖格，展示已覆盖格/总格与缺口，未匹配 / 校验失败 / 无法判定逐行列明
-  原因，结果随分析保存并确定性导出；
+  原因；调用值触达 `pattern` 等未支持关键字时该行记为**无法判定**（列出关键字
+  与位置，不计覆盖），结果随分析保存并确定性导出；
 - **确定性 JSON 导出**（键排序、无多余空白），响应头携带 SHA-256 指纹；
 - PostgreSQL 持久化分析记录与原始文档包（用于反例重放）；数据库不可用时
   自动降级为进程内存储；
@@ -148,6 +149,12 @@ query/header/cookie/path 的文本值会按参数 schema 尝试标量 coerce（�
    content 媒体类型、body schema）、**响应体**（status 归属、content 与实体一致性、
    body schema）的**可判定约束全部通过**时才覆盖该格；任一 schema 无法解析/含循环
    → **无法判定**（不给覆盖）；任一约束失败 → **校验失败**。
+   已知约束全部通过后，引擎还会**沿调用实际取值遍历解析后的 schema 图**
+   （本地 `$ref`、嵌套属性、数组元素、`oneOf`/`anyOf` 组合分支）：只要该行
+   能否通过仍依赖 `pattern`、`not`、`contains` 等**未支持关键字**，该行记为
+   **无法判定**并在原因中列出关键字及其位置（跨文件时含文件名），不增加
+   已覆盖格；**未触达的可选属性不会阻断覆盖**，与取值类型无关的关键字
+   （如整数值上的 `pattern`）也不会误报。
 4. **零分母**：一个 operation 只有非 JSON 媒体（或无任何可覆盖格）时标记
    **「无适用格」**，不参与覆盖率分母。
 
@@ -320,11 +327,11 @@ app/
     pointer.py           # JSON Pointer (RFC 6901) 工具
     resolver.py          # 本地/跨文件 $ref 解析（外部引用拒绝抓取）
     schemagraph.py       # 规范化 Schema 图：$ref、allOf 合并、循环终止
-    instance.py          # 最小实例生成 + 模式校验（反例重放基础）
+    instance.py          # 最小实例生成 + 模式校验（反例重放基础）+ 沿实际取值检测未支持关键字
     endpointrequest.py   # 端点级最小 JSON 请求构造与基线请求约束核对
     structuralreplay.py  # 结构性 finding（参数/请求体/状态码/媒体类型增删）的结构化反例与语义重放
     comparator.py        # 兼容性比较引擎与最小反例综合
-    coverage.py          # 调用覆盖：NDJSON 解析、路径归属、参数/请求体/响应体约束核对、覆盖格
+    coverage.py          # 调用覆盖：NDJSON 解析、路径归属、参数/请求体/响应体约束核对、未支持关键字沿值判定、覆盖格
     replay.py            # 双侧重放校验（模式级 + 端点级）
     rules.py             # 规则目录与严重度
   analysis.py            # 编排：加载→比较→序列化→存储
@@ -332,7 +339,7 @@ app/
   db.py / store.py       # PostgreSQL 持久化 + 内存降级（含调用覆盖）
   static/                # 原生 JS 前端（无框架、无构建步骤）
 examples/                # 基线 / 候选示例文档包 + calls-baseline.ndjson 调用记录
-tests/                   # pytest（引擎/循环 27 项 + API 25 项 + 调用覆盖 19 项）
+tests/                   # pytest（引擎/循环 27 项 + API 25 项 + 调用覆盖 26 项）
 ```
 
 ## 说明与边界

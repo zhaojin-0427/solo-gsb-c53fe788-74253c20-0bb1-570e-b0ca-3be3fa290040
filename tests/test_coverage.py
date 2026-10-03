@@ -350,6 +350,160 @@ def test_response_status_undeclared_fails(client):
     assert any("未在操作响应中声明" in x for x in doc["rows"][0]["reasons"])
 
 
+# ============================================================== 未支持关键字
+def test_unsupported_keyword_in_parameter(client):
+    spec = _spec({"/p": {"get": {"parameters": [
+        {"name": "q", "in": "query",
+         "schema": {"type": "string", "pattern": "^a"}}],
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p", "query": {"q": "abc"},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    # 列出关键字与位置
+    assert any("pattern" in x and "#/paths/" in x for x in row["reasons"])
+    # 不计覆盖
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+
+
+def test_unsupported_keyword_in_request_body_via_ref(client):
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"required": True, "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/Payload"}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    spec["components"] = {"schemas": {"Payload": {
+        "type": "object", "required": ["a"],
+        "properties": {"a": {"type": "string"},
+                       "b": {"type": "string", "pattern": "^x"}}}}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        # 触达 b（pattern）→ 无法判定
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"a": "1", "b": "xray"}},
+         "response": {"status": 200}},
+        # 可选属性 b 未触达 → 不误阻断
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": {"a": "1"}},
+         "response": {"status": 200}},
+    ]).json()
+    rows = doc["rows"]
+    assert rows[0]["outcome"] == "undetermined"
+    assert any("pattern" in x and "components/schemas/Payload" in x
+               for x in rows[0]["reasons"])
+    assert rows[1]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_unsupported_keyword_in_response_items(client):
+    spec = _spec({"/p": {"get": {"responses": {"200": {"description": "d",
+        "content": {"application/json": {"schema": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^a"}}}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": ["abc"]}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x and "/items/" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_unsupported_keyword_in_oneof_branch(client):
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^a"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "b"},
+                        "v": {"type": "integer"}}}]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        # 仅命中含 pattern 的分支 → 无法判定
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"kind": "a", "v": "abc"}},
+         "response": {"status": 200}},
+        # 命中干净分支 → 覆盖
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"kind": "b", "v": 5}},
+         "response": {"status": 200}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert any("pattern" in x and "oneOf/0" in x
+               for x in doc["rows"][0]["reasons"])
+    assert doc["rows"][1]["outcome"] == "covered"
+
+
+def test_unsupported_keyword_in_additional_properties(client):
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "additionalProperties": {"type": "string",
+                                     "pattern": "^a"}}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": {"x": "abc"}},
+         "response": {"status": 200}},
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": {}},
+         "response": {"status": 200}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert any("additionalProperties" in x
+               for x in doc["rows"][0]["reasons"])
+    assert doc["rows"][1]["outcome"] == "covered"
+
+
+def test_unsupported_keyword_irrelevant_type_still_covered(client):
+    # pattern 只约束字符串；整数值的通过与否不依赖它
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": {
+            "pattern": "^a", "minimum": 1}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": 5},
+         "response": {"status": 200}},
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": "abc"},
+         "response": {"status": 200}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["rows"][1]["outcome"] == "undetermined"
+
+
+def test_unsupported_keyword_not_keyword_any_type(client):
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": {
+            "type": "integer", "not": {"const": 5}}}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": 7},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("not" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
 # ============================================================== HTTP surface
 def test_coverage_404_unknown_analysis(client):
     r = _upload(client, "nope", "baseline", [
